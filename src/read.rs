@@ -7,9 +7,6 @@
 // except according to those terms.
 
 use std::{char, cmp, io, str};
-use std::ops::Deref;
-
-use iter::LineColIterator;
 
 use super::error::{Error, ErrorCode, Result};
 
@@ -58,7 +55,10 @@ pub trait Read<'de>: private::Sealed {
     /// string until the next quotation mark using the given scratch space if
     /// necessary. The scratch space is initially empty.
     #[doc(hidden)]
-    fn parse_str<'s>(&'s mut self, scratch: &'s mut Vec<u8>) -> Result<Reference<'de, 's, str>>;
+    fn parse_str<'s, T, F: FnOnce(&str) -> T>(
+        &mut self,
+        f: F
+    ) -> Result<T>;
 
     /// Assumes the previous byte was a quotation mark. Parses a JSON-escaped
     /// string until the next quotation mark using the given scratch space if
@@ -67,35 +67,39 @@ pub trait Read<'de>: private::Sealed {
     /// This function returns the raw bytes in the string with escape sequences
     /// expanded but without performing unicode validation.
     #[doc(hidden)]
-    fn parse_str_raw<'s>(
-        &'s mut self,
-        scratch: &'s mut Vec<u8>,
-    ) -> Result<Reference<'de, 's, [u8]>>;
+    fn parse_str_raw<'s, T, F: FnOnce(&[u8]) -> T>(
+        &mut self,
+        f: F,
+    ) -> Result<T>;
 
     /// Assumes the previous byte was a quotation mark. Parses a JSON-escaped
     /// string until the next quotation mark but discards the data.
     #[doc(hidden)]
     fn ignore_str(&mut self) -> Result<()>;
+
+    #[doc(hidden)]
+    fn push_scratch(&mut self, u8);
 }
 
+#[derive(Clone, Copy)]
 pub struct Position {
     pub line: usize,
     pub column: usize,
 }
 
-pub enum Reference<'b, 'c, T: ?Sized + 'static> {
-    Borrowed(&'b T),
-    Copied(&'c T),
-}
-
-impl<'b, 'c, T: ?Sized + 'static> Deref for Reference<'b, 'c, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        match *self {
-            Reference::Borrowed(b) => b,
-            Reference::Copied(c) => c,
+impl Position {
+    pub fn update(&mut self, slice: &[u8]) -> usize {
+        let mut start_bytes = 0;
+        for b in slice {
+            if *b == b'\n' {
+                start_bytes += self.column + 1;
+                self.line += 1;
+                self.column = 0;
+            } else {
+                self.column += 1;
+            }
         }
+        start_bytes
     }
 }
 
@@ -104,9 +108,12 @@ pub struct IoRead<R>
 where
     R: io::Read,
 {
-    iter: LineColIterator<io::Bytes<R>>,
+    reader: R,
     /// Temporary storage of peeked byte.
     ch: Option<u8>,
+    start_of_line: usize,
+    pos: Position,
+    scratch: Vec<u8>,
 }
 
 /// JSON input source that reads from a slice of bytes.
@@ -117,6 +124,7 @@ pub struct SliceRead<'a> {
     slice: &'a [u8],
     /// Index of the *next* byte that will be returned by next() or peek().
     index: usize,
+    scratch: Vec<u8>,
 }
 
 /// JSON input source that reads from a UTF-8 string.
@@ -140,8 +148,26 @@ where
     /// Create a JSON input source to read from a std::io input stream.
     pub fn new(reader: R) -> Self {
         IoRead {
-            iter: LineColIterator::new(reader.bytes()),
+            reader,
             ch: None,
+            start_of_line: 0,
+            pos: Position { line: 1, column: 0 },
+            scratch: Vec::with_capacity(128),
+        }
+    }
+
+    fn read_one_byte(&mut self) -> Option<io::Result<u8>> {
+        let mut buf = [0];
+        loop {
+            return match self.reader.read(&mut buf) {
+                Ok(0) => None,
+                Ok(..) => {
+                    self.start_of_line += self.pos.update(&buf);
+                    Some(Ok(buf[0]))
+                },
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => Some(Err(e)),
+            };
         }
     }
 }
@@ -152,41 +178,161 @@ where
 {
 }
 
-impl<R> IoRead<R>
+trait IoReadSpecialization {
+    fn parse_str_bytes<'s, T, F>(
+            &mut self,
+            validate: bool,
+            result: F,
+        ) -> Result<T>
+        where
+            F: FnOnce(Position, &[u8]) -> Result<T>;
+}
+
+impl<R> IoReadSpecialization for IoRead<R>
 where
     R: io::Read,
 {
-    fn parse_str_bytes<'s, T, F>(
-        &'s mut self,
-        scratch: &'s mut Vec<u8>,
+    default fn parse_str_bytes<'s, T, F>(
+        &mut self,
         validate: bool,
         result: F,
     ) -> Result<T>
     where
-        T: 's,
-        F: FnOnce(&'s Self, &'s [u8]) -> Result<T>,
+        F: FnOnce(Position, &[u8]) -> Result<T>,
     {
+        self.scratch.clear();
         loop {
             let ch = try!(next_or_eof(self));
             if !ESCAPE[ch as usize] {
-                scratch.push(ch);
+                self.scratch.push(ch);
                 continue;
             }
             match ch {
                 b'"' => {
-                    return result(self, scratch);
+                    return result(self.pos, &self.scratch);
                 }
                 b'\\' => {
-                    try!(parse_escape(self, scratch));
+                    try!(parse_escape(self));
                 }
                 _ => {
                     if validate {
-                        return error(self, ErrorCode::InvalidUnicodeCodePoint);
+                        return error(self.position(), ErrorCode::InvalidUnicodeCodePoint);
                     }
-                    scratch.push(ch);
+                    self.scratch.push(ch);
                 }
             }
         }
+    }
+}
+
+impl<R> IoReadSpecialization for IoRead<R>
+where
+    R: io::BufRead,
+{
+    // If we read the whole string into the buffer at once, we can avoid
+    // pushing into the scratch space
+    fn parse_str_bytes<'s, T, F>(
+        &mut self,
+        validate: bool,
+        result: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(Position, &[u8]) -> Result<T>,
+    {
+        let ret;
+        let last_consume;
+
+        // This loop is just used for jumping in the fast path
+        loop {
+            let mut ch;
+            let consumed = {
+                let available = match self.reader.fill_buf() {
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(Error::io(e)),
+                };
+
+                // Fast path to zero copies
+                // TODO(bouk): can be deduped/simplified
+                match available.iter().position(|b| ESCAPE[*b as usize]) {
+                    // In this case we extend/callback with everything except for the last byte
+                    Some(i) => {
+                        let b = available[i];
+                        if b == b'"' {
+                            // Here we are doing a callback without copying anything into scratch, and just using
+                            // the buffer of the io::BufRead to do the callback. v fast
+                            self.start_of_line += self.pos.update(&available[..i + 1]);
+                            ret = result(self.pos, &available[..i]);
+                            last_consume = i + 1;
+                            // We need to break here because we can only call result once, so we need to break
+                            // out of the loop to tell the Rust borrow checker that we won't
+                            break;
+                        } else {
+                            // Now we need to copy everything read so far into scratch, and do normal reading
+                            self.start_of_line += self.pos.update(&available[..i]);
+                            self.scratch.clear();
+                            self.scratch.extend_from_slice(&available[..i]);
+                            ch = Some(b);
+                            i + 1
+                        }
+                    },
+                    // In this case we put the whole buffer into scratch and do regular reading
+                    None => {
+                        // Reached end of buffer, fall back to normal reading
+                        self.start_of_line += self.pos.update(available);
+                        self.scratch.clear();
+                        self.scratch.extend_from_slice(available);
+                        ch = None;
+                        available.len()
+                    },
+                }
+            };
+            self.reader.consume(consumed);
+
+            loop {
+                match ch.take() {
+                    Some(b'"') => {
+                        return result(self.pos, &self.scratch);
+                    }
+                    Some(b'\\') => {
+                        try!(parse_escape(self));
+                    }
+                    Some(ch) => {
+                        if validate {
+                            return error(self.pos, ErrorCode::InvalidUnicodeCodePoint);
+                        }
+                        self.scratch.push(ch);
+                    }
+                    None => {
+                        let consumed = {
+                            let available = match self.reader.fill_buf() {
+                                Ok(n) => n,
+                                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                                Err(e) => return Err(Error::io(e)),
+                            };
+
+                            match available.iter().position(|b| ESCAPE[*b as usize]) {
+                                Some(i) => {
+                                    self.start_of_line += self.pos.update(&available[..i]);
+                                    self.scratch.extend_from_slice(&available[..i]);
+                                    ch = Some(available[i]);
+                                    i + 1
+                                },
+                                None => {
+                                    self.start_of_line += self.pos.update(available);
+                                    self.scratch.extend_from_slice(available);
+                                    ch = None;
+                                    available.len()
+                                },
+                            }
+                        };
+                        self.reader.consume(consumed);
+                    }
+                }
+            }
+        }
+        self.reader.consume(last_consume);
+        ret
     }
 }
 
@@ -199,7 +345,7 @@ where
         match self.ch.take() {
             Some(ch) => Ok(Some(ch)),
             None => {
-                match self.iter.next() {
+                match self.read_one_byte() {
                     Some(Err(err)) => Err(err),
                     Some(Ok(ch)) => Ok(Some(ch)),
                     None => Ok(None),
@@ -213,7 +359,7 @@ where
         match self.ch {
             Some(ch) => Ok(Some(ch)),
             None => {
-                match self.iter.next() {
+                match self.read_one_byte() {
                     Some(Err(err)) => Err(err),
                     Some(Ok(ch)) => {
                         self.ch = Some(ch);
@@ -231,10 +377,7 @@ where
     }
 
     fn position(&self) -> Position {
-        Position {
-            line: self.iter.line(),
-            column: self.iter.col(),
-        }
+        self.pos
     }
 
     fn peek_position(&self) -> Position {
@@ -245,22 +388,23 @@ where
 
     fn byte_offset(&self) -> usize {
         match self.ch {
-            Some(_) => self.iter.byte_offset() - 1,
-            None => self.iter.byte_offset(),
+            Some(_) => self.start_of_line + self.pos.column + 1,
+            None => self.start_of_line + self.pos.column,
         }
     }
 
-    fn parse_str<'s>(&'s mut self, scratch: &'s mut Vec<u8>) -> Result<Reference<'de, 's, str>> {
-        self.parse_str_bytes(scratch, true, as_str)
-            .map(Reference::Copied)
+    fn parse_str<'s, T, F: FnOnce(&str) -> T>(
+        &mut self,
+        f: F
+    ) -> Result<T> {
+        self.parse_str_bytes(true, |pos, s| as_str(pos, s).map(|s| f(s)))
     }
 
-    fn parse_str_raw<'s>(
-        &'s mut self,
-        scratch: &'s mut Vec<u8>,
-    ) -> Result<Reference<'de, 's, [u8]>> {
-        self.parse_str_bytes(scratch, false, |_, bytes| Ok(bytes))
-            .map(Reference::Copied)
+    fn parse_str_raw<'s, T, F: FnOnce(&[u8]) -> T>(
+        &mut self,
+        f: F
+    ) -> Result<T> {
+        self.parse_str_bytes(false, |_, bytes| Ok(f(bytes)))
     }
 
     fn ignore_str(&mut self) -> Result<()> {
@@ -277,10 +421,15 @@ where
                     try!(ignore_escape(self));
                 }
                 _ => {
-                    return error(self, ErrorCode::InvalidUnicodeCodePoint);
+                    return error(self.position(), ErrorCode::InvalidUnicodeCodePoint);
                 }
             }
         }
+    }
+
+    #[inline]
+    fn push_scratch(&mut self, b: u8) {
+        self.scratch.push(b);
     }
 }
 
@@ -292,73 +441,62 @@ impl<'a> SliceRead<'a> {
         SliceRead {
             slice: slice,
             index: 0,
+            scratch: Vec::with_capacity(128),
         }
     }
 
     fn position_of_index(&self, i: usize) -> Position {
         let mut pos = Position { line: 1, column: 0 };
-        for ch in &self.slice[..i] {
-            match *ch {
-                b'\n' => {
-                    pos.line += 1;
-                    pos.column = 0;
-                }
-                _ => {
-                    pos.column += 1;
-                }
-            }
-        }
+        pos.update(&self.slice[..i]);
         pos
     }
 
     /// The big optimization here over IoRead is that if the string contains no
     /// backslash escape sequences, the returned &str is a slice of the raw JSON
     /// data so we avoid copying into the scratch space.
-    fn parse_str_bytes<'s, T: ?Sized, F>(
-        &'s mut self,
-        scratch: &'s mut Vec<u8>,
+    fn parse_str_bytes<'s, T, F>(
+        &mut self,
         validate: bool,
         result: F,
-    ) -> Result<Reference<'a, 's, T>>
+    ) -> Result<T>
     where
-        T: 's,
-        F: for<'f> FnOnce(&'s Self, &'f [u8]) -> Result<&'f T>,
+        F: FnOnce(Position, &[u8]) -> Result<T>,
     {
+        self.scratch.clear();
         // Index of the first byte not yet copied into the scratch space.
         let mut start = self.index;
-
         loop {
             while self.index < self.slice.len() && !ESCAPE[self.slice[self.index] as usize] {
                 self.index += 1;
             }
             if self.index == self.slice.len() {
-                return error(self, ErrorCode::EofWhileParsingString);
+                return error(self.position(), ErrorCode::EofWhileParsingString);
             }
             match self.slice[self.index] {
                 b'"' => {
-                    if scratch.is_empty() {
+                    if self.scratch.is_empty() {
                         // Fast path: return a slice of the raw JSON without any
                         // copying.
                         let borrowed = &self.slice[start..self.index];
                         self.index += 1;
-                        return result(self, borrowed).map(Reference::Borrowed);
+                        return result(self.position(), borrowed);
                     } else {
-                        scratch.extend_from_slice(&self.slice[start..self.index]);
+                        self.scratch.extend_from_slice(&self.slice[start..self.index]);
                         // "as &[u8]" is required for rustc 1.8.0
-                        let copied = scratch as &[u8];
+                        let copied = &self.scratch as &[u8];
                         self.index += 1;
-                        return result(self, copied).map(Reference::Copied);
+                        return result(self.position(), copied);
                     }
                 }
                 b'\\' => {
-                    scratch.extend_from_slice(&self.slice[start..self.index]);
+                    self.scratch.extend_from_slice(&self.slice[start..self.index]);
                     self.index += 1;
-                    try!(parse_escape(self, scratch));
+                    try!(parse_escape(self));
                     start = self.index;
                 }
                 _ => {
                     if validate {
-                        return error(self, ErrorCode::InvalidUnicodeCodePoint);
+                        return error(self.position(), ErrorCode::InvalidUnicodeCodePoint);
                     }
                     self.index += 1;
                 }
@@ -417,15 +555,18 @@ impl<'a> Read<'a> for SliceRead<'a> {
         self.index
     }
 
-    fn parse_str<'s>(&'s mut self, scratch: &'s mut Vec<u8>) -> Result<Reference<'a, 's, str>> {
-        self.parse_str_bytes(scratch, true, as_str)
+    fn parse_str<'s, T, F: FnOnce(&str) -> T>(
+        &mut self,
+        f: F
+    ) -> Result<T> {
+        self.parse_str_bytes(true, |pos, bytes| as_str(pos, bytes).map(|s| f(s)))
     }
 
-    fn parse_str_raw<'s>(
-        &'s mut self,
-        scratch: &'s mut Vec<u8>,
-    ) -> Result<Reference<'a, 's, [u8]>> {
-        self.parse_str_bytes(scratch, false, |_, bytes| Ok(bytes))
+    fn parse_str_raw<'s, T, F: FnOnce(&[u8]) -> T>(
+        &mut self,
+        f: F,
+    ) -> Result<T> {
+        self.parse_str_bytes(false, |_, bytes| Ok(f(bytes)))
     }
 
     fn ignore_str(&mut self) -> Result<()> {
@@ -434,7 +575,7 @@ impl<'a> Read<'a> for SliceRead<'a> {
                 self.index += 1;
             }
             if self.index == self.slice.len() {
-                return error(self, ErrorCode::EofWhileParsingString);
+                return error(self.position(), ErrorCode::EofWhileParsingString);
             }
             match self.slice[self.index] {
                 b'"' => {
@@ -446,10 +587,15 @@ impl<'a> Read<'a> for SliceRead<'a> {
                     try!(ignore_escape(self));
                 }
                 _ => {
-                    return error(self, ErrorCode::InvalidUnicodeCodePoint);
+                    return error(self.position(), ErrorCode::InvalidUnicodeCodePoint);
                 }
             }
         }
+    }
+
+    #[inline]
+    fn push_scratch(&mut self, b: u8) {
+        self.scratch.push(b);
     }
 }
 
@@ -492,26 +638,32 @@ impl<'a> Read<'a> for StrRead<'a> {
         self.delegate.byte_offset()
     }
 
-    fn parse_str<'s>(&'s mut self, scratch: &'s mut Vec<u8>) -> Result<Reference<'a, 's, str>> {
+    fn parse_str<'s, T, F: FnOnce(&str) -> T>(
+        &mut self,
+        f: F,
+    ) -> Result<T> {
         self.delegate
-            .parse_str_bytes(
-                scratch, true, |_, bytes| {
-                    // The input is assumed to be valid UTF-8 and the \u-escapes are
-                    // checked along the way, so don't need to check here.
-                    Ok(unsafe { str::from_utf8_unchecked(bytes) })
-                }
-            )
+            .parse_str_bytes(true, |_, bytes| {
+                // The input is assumed to be valid UTF-8 and the \u-escapes are
+                // checked along the way, so don't need to check here.
+                Ok(f(unsafe { str::from_utf8_unchecked(bytes) }))
+            })
     }
 
-    fn parse_str_raw<'s>(
-        &'s mut self,
-        scratch: &'s mut Vec<u8>,
-    ) -> Result<Reference<'a, 's, [u8]>> {
-        self.delegate.parse_str_raw(scratch)
+    fn parse_str_raw<'s, T, F: FnOnce(&[u8]) -> T>(
+        &mut self,
+        f: F,
+    ) -> Result<T> {
+        self.delegate.parse_str_raw(f)
     }
 
     fn ignore_str(&mut self) -> Result<()> {
         self.delegate.ignore_str()
+    }
+
+    #[inline]
+    fn push_scratch(&mut self, b: u8) {
+        self.delegate.scratch.push(b);
     }
 }
 
@@ -548,53 +700,52 @@ static ESCAPE: [bool; 256] = [
 fn next_or_eof<'de, R: ?Sized + Read<'de>>(read: &mut R) -> Result<u8> {
     match try!(read.next().map_err(Error::io)) {
         Some(b) => Ok(b),
-        None => error(read, ErrorCode::EofWhileParsingString),
+        None => error(read.position(), ErrorCode::EofWhileParsingString),
     }
 }
 
-fn error<'de, R: ?Sized + Read<'de>, T>(read: &R, reason: ErrorCode) -> Result<T> {
-    let pos = read.position();
+fn error<'de, T>(pos: Position, reason: ErrorCode) -> Result<T> {
     Err(Error::syntax(reason, pos.line, pos.column))
 }
 
-fn as_str<'de, 's, R: Read<'de>>(read: &R, slice: &'s [u8]) -> Result<&'s str> {
-    str::from_utf8(slice).or_else(|_| error(read, ErrorCode::InvalidUnicodeCodePoint))
+fn as_str<'de, 's>(pos: Position, slice: &'s [u8]) -> Result<&'s str> {
+    str::from_utf8(slice).or_else(|_| error(pos, ErrorCode::InvalidUnicodeCodePoint))
 }
 
 /// Parses a JSON escape sequence and appends it into the scratch space. Assumes
 /// the previous byte read was a backslash.
-fn parse_escape<'de, R: Read<'de>>(read: &mut R, scratch: &mut Vec<u8>) -> Result<()> {
+fn parse_escape<'de, R: Read<'de>>(read: &mut R) -> Result<()> {
     let ch = try!(next_or_eof(read));
 
     match ch {
-        b'"' => scratch.push(b'"'),
-        b'\\' => scratch.push(b'\\'),
-        b'/' => scratch.push(b'/'),
-        b'b' => scratch.push(b'\x08'),
-        b'f' => scratch.push(b'\x0c'),
-        b'n' => scratch.push(b'\n'),
-        b'r' => scratch.push(b'\r'),
-        b't' => scratch.push(b'\t'),
+        b'"' => read.push_scratch(b'"'),
+        b'\\' => read.push_scratch(b'\\'),
+        b'/' => read.push_scratch(b'/'),
+        b'b' => read.push_scratch(b'\x08'),
+        b'f' => read.push_scratch(b'\x0c'),
+        b'n' => read.push_scratch(b'\n'),
+        b'r' => read.push_scratch(b'\r'),
+        b't' => read.push_scratch(b'\t'),
         b'u' => {
             let c = match try!(decode_hex_escape(read)) {
                 0xDC00...0xDFFF => {
-                    return error(read, ErrorCode::LoneLeadingSurrogateInHexEscape);
+                    return error(read.position(), ErrorCode::LoneLeadingSurrogateInHexEscape);
                 }
 
                 // Non-BMP characters are encoded as a sequence of
                 // two hex escapes, representing UTF-16 surrogates.
                 n1 @ 0xD800...0xDBFF => {
                     if try!(next_or_eof(read)) != b'\\' {
-                        return error(read, ErrorCode::UnexpectedEndOfHexEscape);
+                        return error(read.position(), ErrorCode::UnexpectedEndOfHexEscape);
                     }
                     if try!(next_or_eof(read)) != b'u' {
-                        return error(read, ErrorCode::UnexpectedEndOfHexEscape);
+                        return error(read.position(), ErrorCode::UnexpectedEndOfHexEscape);
                     }
 
                     let n2 = try!(decode_hex_escape(read));
 
                     if n2 < 0xDC00 || n2 > 0xDFFF {
-                        return error(read, ErrorCode::LoneLeadingSurrogateInHexEscape);
+                        return error(read.position(), ErrorCode::LoneLeadingSurrogateInHexEscape);
                     }
 
                     let n = (((n1 - 0xD800) as u32) << 10 | (n2 - 0xDC00) as u32) + 0x1_0000;
@@ -602,7 +753,7 @@ fn parse_escape<'de, R: Read<'de>>(read: &mut R, scratch: &mut Vec<u8>) -> Resul
                     match char::from_u32(n) {
                         Some(c) => c,
                         None => {
-                            return error(read, ErrorCode::InvalidUnicodeCodePoint);
+                            return error(read.position(), ErrorCode::InvalidUnicodeCodePoint);
                         }
                     }
                 }
@@ -611,20 +762,21 @@ fn parse_escape<'de, R: Read<'de>>(read: &mut R, scratch: &mut Vec<u8>) -> Resul
                     match char::from_u32(n as u32) {
                         Some(c) => c,
                         None => {
-                            return error(read, ErrorCode::InvalidUnicodeCodePoint);
+                            return error(read.position(), ErrorCode::InvalidUnicodeCodePoint);
                         }
                     }
                 }
             };
 
-            // FIXME: this allocation is required in order to be compatible with stable
-            // rust, which doesn't support encoding a `char` into a stack buffer.
-            let mut buf = String::new();
-            buf.push(c);
-            scratch.extend(buf.bytes());
+
+            let mut buf = [0; 4];
+            c.encode_utf8(&mut buf);
+            for b in buf[..c.len_utf8()].iter() {
+                read.push_scratch(*b);
+            }
         }
         _ => {
-            return error(read, ErrorCode::InvalidEscape);
+            return error(read.position(), ErrorCode::InvalidEscape);
         }
     }
 
@@ -641,23 +793,23 @@ fn ignore_escape<'de, R: ?Sized + Read<'de>>(read: &mut R) -> Result<()> {
         b'u' => {
             let n = match try!(decode_hex_escape(read)) {
                 0xDC00...0xDFFF => {
-                    return error(read, ErrorCode::LoneLeadingSurrogateInHexEscape);
+                    return error(read.position(), ErrorCode::LoneLeadingSurrogateInHexEscape);
                 }
 
                 // Non-BMP characters are encoded as a sequence of
                 // two hex escapes, representing UTF-16 surrogates.
                 n1 @ 0xD800...0xDBFF => {
                     if try!(next_or_eof(read)) != b'\\' {
-                        return error(read, ErrorCode::UnexpectedEndOfHexEscape);
+                        return error(read.position(), ErrorCode::UnexpectedEndOfHexEscape);
                     }
                     if try!(next_or_eof(read)) != b'u' {
-                        return error(read, ErrorCode::UnexpectedEndOfHexEscape);
+                        return error(read.position(), ErrorCode::UnexpectedEndOfHexEscape);
                     }
 
                     let n2 = try!(decode_hex_escape(read));
 
                     if n2 < 0xDC00 || n2 > 0xDFFF {
-                        return error(read, ErrorCode::LoneLeadingSurrogateInHexEscape);
+                        return error(read.position(), ErrorCode::LoneLeadingSurrogateInHexEscape);
                     }
 
                     (((n1 - 0xD800) as u32) << 10 | (n2 - 0xDC00) as u32) + 0x1_0000
@@ -667,11 +819,11 @@ fn ignore_escape<'de, R: ?Sized + Read<'de>>(read: &mut R) -> Result<()> {
             };
 
             if char::from_u32(n).is_none() {
-                return error(read, ErrorCode::InvalidUnicodeCodePoint);
+                return error(read.position(), ErrorCode::InvalidUnicodeCodePoint);
             }
         }
         _ => {
-            return error(read, ErrorCode::InvalidEscape);
+            return error(read.position(), ErrorCode::InvalidEscape);
         }
     }
 
@@ -690,7 +842,7 @@ fn decode_hex_escape<'de, R: ?Sized + Read<'de>>(read: &mut R) -> Result<u16> {
             b'e' | b'E' => n * 16_u16 + 14_u16,
             b'f' | b'F' => n * 16_u16 + 15_u16,
             _ => {
-                return error(read, ErrorCode::InvalidEscape);
+                return error(read.position(), ErrorCode::InvalidEscape);
             }
         };
     }

@@ -8,7 +8,7 @@
 
 //! Deserialize JSON data to a Rust data structure.
 
-use std::{i32, u64};
+use std::{i32, u64, str};
 use std::io;
 use std::marker::PhantomData;
 
@@ -16,7 +16,7 @@ use serde::de::{self, Expected, Unexpected};
 
 use super::error::{Error, ErrorCode, Result};
 
-use read::{self, Reference};
+use read;
 
 pub use read::{Read, IoRead, SliceRead, StrRead};
 
@@ -25,13 +25,12 @@ pub use read::{Read, IoRead, SliceRead, StrRead};
 /// A structure that deserializes JSON into Rust values.
 pub struct Deserializer<R> {
     read: R,
-    str_buf: Vec<u8>,
     remaining_depth: u8,
 }
 
 impl<'de, R> Deserializer<R>
 where
-    R: read::Read<'de>,
+    R: Read<'de>,
 {
     /// Create a JSON deserializer from one of the possible serde_json input
     /// sources.
@@ -44,7 +43,6 @@ where
     pub fn new(read: R) -> Self {
         Deserializer {
             read: read,
-            str_buf: Vec::with_capacity(128),
             remaining_depth: 128,
         }
     }
@@ -222,10 +220,12 @@ impl<'de, R: Read<'de>> Deserializer<R> {
             }
             b'"' => {
                 self.eat_char();
-                self.str_buf.clear();
-                match self.read.parse_str(&mut self.str_buf) {
-                    Ok(s) => de::Error::invalid_type(Unexpected::Str(&s), exp),
-                    Err(err) => return err,
+
+                match self.read.parse_str(|s| {
+                    de::Error::invalid_type(Unexpected::Str(s), exp)
+                }) {
+                    Ok(e) => e,
+                    Err(err) => err,
                 }
             }
             b'[' => {
@@ -834,11 +834,7 @@ impl<'de, 'a, R: Read<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> {
             b'0'...b'9' => try!(self.parse_integer(true)).visit(visitor),
             b'"' => {
                 self.eat_char();
-                self.str_buf.clear();
-                match try!(self.read.parse_str(&mut self.str_buf)) {
-                    Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
-                    Reference::Copied(s) => visitor.visit_str(s),
-                }
+                try!(self.read.parse_str(|s| visitor.visit_str(s)))
             }
             b'[' => {
                 self.remaining_depth -= 1;
@@ -1008,11 +1004,7 @@ impl<'de, 'a, R: Read<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> {
         let value = match peek {
             b'"' => {
                 self.eat_char();
-                self.str_buf.clear();
-                match try!(self.read.parse_str(&mut self.str_buf)) {
-                    Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
-                    Reference::Copied(s) => visitor.visit_str(s),
-                }
+                try!(self.read.parse_str(|s| visitor.visit_str(s)))
             }
             _ => Err(self.peek_invalid_type(&visitor)),
         };
@@ -1125,11 +1117,7 @@ impl<'de, 'a, R: Read<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> {
         let value = match peek {
             b'"' => {
                 self.eat_char();
-                self.str_buf.clear();
-                match try!(self.read.parse_str_raw(&mut self.str_buf)) {
-                    Reference::Borrowed(b) => visitor.visit_borrowed_bytes(b),
-                    Reference::Copied(b) => visitor.visit_bytes(b),
-                }
+                try!(self.read.parse_str_raw(|b| visitor.visit_bytes(b)))
             }
             b'[' => self.deserialize_seq(visitor),
             _ => Err(self.peek_invalid_type(&visitor)),
@@ -1652,13 +1640,10 @@ macro_rules! deserialize_integer_key {
             V: de::Visitor<'de>,
         {
             self.de.eat_char();
-            self.de.str_buf.clear();
-            let string = try!(self.de.read.parse_str(&mut self.de.str_buf));
-            match (string.parse(), string) {
+            try!(self.de.read.parse_str(|string| match (string.parse(), string) {
                 (Ok(integer), _) => visitor.$visit(integer),
-                (Err(_), Reference::Borrowed(s)) => visitor.visit_borrowed_str(s),
-                (Err(_), Reference::Copied(s)) => visitor.visit_str(s),
-            }
+                (Err(_), s) => visitor.visit_str(s),
+            }))
         }
     }
 }
@@ -1675,11 +1660,7 @@ where
         V: de::Visitor<'de>,
     {
         self.de.eat_char();
-        self.de.str_buf.clear();
-        match try!(self.de.read.parse_str(&mut self.de.str_buf)) {
-            Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
-            Reference::Copied(s) => visitor.visit_str(s),
-        }
+        try!(self.de.read.parse_str(|s| visitor.visit_str(s)))
     }
 
     deserialize_integer_key!(deserialize_i8 => visit_i8);
@@ -1777,7 +1758,7 @@ pub struct StreamDeserializer<'de, R, T> {
 
 impl<'de, R, T> StreamDeserializer<'de, R, T>
 where
-    R: read::Read<'de>,
+    R: Read<'de>,
     T: de::Deserialize<'de>,
 {
     /// Create a JSON stream deserializer from one of the possible serde_json
@@ -1996,6 +1977,7 @@ where
 ///     println!("{:#?}", u);
 /// }
 /// ```
+// TODO(bouk): switch to bufread implementation, should be just as fast
 pub fn from_slice<'a, T>(v: &'a [u8]) -> Result<T>
 where
     T: de::Deserialize<'a>,

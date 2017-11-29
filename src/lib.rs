@@ -308,6 +308,7 @@
 //! [to_vec]: https://docs.serde.rs/serde_json/ser/fn.to_vec.html
 //! [to_writer]: https://docs.serde.rs/serde_json/ser/fn.to_writer.html
 //! [macro]: https://docs.serde.rs/serde_json/macro.json.html
+#![feature(specialization)]
 
 #![doc(html_root_url = "https://docs.rs/serde_json/1.0.7")]
 #![cfg_attr(feature = "cargo-clippy", deny(clippy, clippy_pedantic))]
@@ -380,6 +381,5 @@ pub mod map;
 pub mod ser;
 pub mod value;
 
-mod iter;
 mod number;
 mod read;
